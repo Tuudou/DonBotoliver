@@ -4,6 +4,10 @@ import os
 import random
 import aiohttp
 from dotenv import load_dotenv
+import json
+from pathlib import Path
+from discord.ui import View, Button
+import asyncio
 
 #Initialize the Bot object (now can handle both commands and events)
 
@@ -43,6 +47,27 @@ async def on_message(message):
     # This is crucial: process commands *after* custom message handling
     # so that commands like $test or $avatar still work.
     await bot.process_commands(message) 
+
+# ----------------------------------------------------
+# COMMANDS LOGIC
+# ----------------------------------------------------
+
+#for balance commands
+BAL_FILE = Path("slots_balances.json")
+try:
+    balances = json.loads(BAL_FILE.read_text())
+except Exception:
+    balances = {}
+
+def get_balance(user_id: int) -> int:
+    # default starting balance
+    return int(balances.get(str(user_id), 250))
+
+def set_balance(user_id: int, amount: int) -> None:
+    balances[str(user_id)] = int(max(0, amount))
+    BAL_FILE.write_text(json.dumps(balances))
+
+active_blackjack = {}
 
 # ----------------------------------------------------
 # COMMANDS
@@ -175,6 +200,389 @@ async def coinflip(ctx):
 
     # Edit the original message to show the final result
     await message.edit(content=f"{ctx.author.mention}", embed=embed)
+
+#slots command
+# balance
+@bot.command(aliases=['bal'])
+async def balance(ctx):
+    """Show your slot balance."""
+    bal = get_balance(ctx.author.id)
+    await ctx.send(f"{ctx.author.mention} your balance is **{bal}** coins.")
+
+# daily command
+# simple in-memory cool-down; resets on restart
+_last_daily_claim = set()
+@bot.command()
+@commands.cooldown(1, 86400, commands.BucketType.user)  # 1/day per user
+async def daily(ctx):
+    """Claim a small daily coin bonus."""
+    bonus = 100
+    uid = ctx.author.id
+    bal = get_balance(uid) + bonus
+    set_balance(uid, bal)
+    await ctx.send(f"{ctx.author.mention} claimed **{bonus}** coins! New balance: **{bal}**")
+
+# slot machine command
+@bot.command(aliases=['slots', 'spin'])
+@commands.cooldown(1, 3, commands.BucketType.user)  # prevent spam
+async def slot(ctx, bet: int = 10):
+    """
+    Spin the slot machine. Usage: $slot [bet]
+    Payouts:
+      • Three of a kind: up to 10x
+      • Any two matching: 2x
+      • Any 🍒 anywhere: ~1.2x consolation
+    """
+    if bet <= 0:
+        await ctx.send("Bet must be a positive number.")
+        return
+    if bet > 100000:
+        await ctx.send("Whoa there high roller 😅 — max bet is 100,000.")
+        return
+
+    uid = ctx.author.id
+    bal = get_balance(uid)
+    if bet > bal:
+        await ctx.send(f"Not enough coins! Your balance is **{bal}**. Use `$daily` for a top-up.")
+        return
+
+    # Reels & weights (rarer symbols pay more)
+    symbols = ['🍒', '🍋', '🍊', '🍇', '🔔', '⭐', '7️⃣']
+    weights = [30,    25,    20,    15,     7,     2,    1]  # sums ~100
+
+    # Spin 3 reels
+    reels = random.choices(symbols, weights=weights, k=3)
+
+    # Evaluate payout
+    payout = 0
+    s1, s2, s3 = reels
+    three_kind = (s1 == s2 == s3)
+    two_match = (s1 == s2) or (s2 == s3) or (s1 == s3)
+
+    if three_kind:
+        if s1 == '7️⃣':
+            payout = bet * 10
+        elif s1 == '⭐':
+            payout = bet * 6
+        elif s1 == '🔔':
+            payout = bet * 5
+        else:
+            payout = bet * 3
+    elif two_match:
+        payout = bet * 2
+    elif '🍒' in reels:
+        payout = int(bet * 1.2)  # small consolation
+
+    net = payout - bet
+    new_bal = bal + net
+    set_balance(uid, new_bal)
+
+    # Build a pretty embed
+    line = " | ".join(reels)
+    won = payout > 0
+    title = "🎰 Slot Machine"
+    desc = f"**{line}**"
+    color = discord.Color.green() if won else discord.Color.red()
+
+    # Fun headline text
+    if three_kind and s1 == '7️⃣':
+        headline = "JACKPOT! 🔥"
+    elif three_kind:
+        headline = "THREE OF A KIND! 💥"
+    elif two_match:
+        headline = "Nice pair! ✨"
+    elif won:
+        headline = "A little something! 🍒"
+    else:
+        headline = "No luck this time…"
+
+    embed = discord.Embed(title=title, description=f"{desc}\n\n{headline}", color=color)
+    embed.add_field(name="Bet", value=f"{bet}", inline=True)
+    embed.add_field(name="Payout", value=f"{payout}", inline=True)
+    embed.add_field(name="Net", value=f"{'+' if net>=0 else ''}{net}", inline=True)
+    embed.set_footer(text=f"Balance: {new_bal}")
+
+    await ctx.send(f"{ctx.author.mention}", embed=embed)
+
+# --------------------------
+# BLACKJACK
+# --------------------------
+
+DEALER_HITS_SOFT_17 = True  # common rule; set False if you prefer dealer stands on soft 17
+
+def _new_deck():
+    ranks = ['A','2','3','4','5','6','7','8','9','10','J','Q','K']
+    suits = ['♠','♥','♦','♣']
+    deck = [(r,s) for r in ranks for s in suits] * 4  # 4 decks; tweak if you want
+    random.shuffle(deck)
+    return deck
+
+def _card_str(card):
+    r,s = card
+    return f"{r}{s}"
+
+def _hand_str(hand, hide_first=False):
+    if hide_first and hand:
+        return "🂠 " + " ".join(_card_str(c) for c in hand[1:])
+    return " ".join(_card_str(c) for c in hand)
+
+def _hand_value(hand):
+    """Return (total, is_soft) where soft means an Ace counted as 11 remains."""
+    total = 0
+    aces = 0
+    for r,_ in hand:
+        if r in ('J','Q','K'):
+            total += 10
+        elif r == 'A':
+            total += 11
+            aces += 1
+        else:
+            total += int(r)
+    # downgrade Aces from 11->1 as needed
+    while total > 21 and aces > 0:
+        total -= 10
+        aces -= 1
+    is_soft = (aces > 0)  # if any Ace still counts as 11
+    return total, is_soft
+
+class BlackjackView(View):
+    def __init__(self, ctx, bet: int):
+        super().__init__(timeout=75)  # seconds of inactivity
+        self.ctx = ctx
+        self.user_id = ctx.author.id
+        self.bet0 = bet            # original bet (for messaging)
+        self.bet = bet             # current stake (doubles will modify)
+        self.deck = _new_deck()
+        self.player = [self.deck.pop(), self.deck.pop()]
+        self.dealer = [self.deck.pop(), self.deck.pop()]
+        self.doubled = False
+        self.resolved = False
+        self.first_action = True
+        self.message = None  # set right after initial send
+
+    # ----- UI helpers -----
+    def _embed(self, reveal_dealer: bool = False, headline: str = "Blackjack"):
+        p_val, p_soft = _hand_value(self.player)
+        d_val, d_soft = _hand_value(self.dealer)
+
+        desc_lines = []
+        desc_lines.append(f"**Dealer:**  {_hand_str(self.dealer, hide_first=not reveal_dealer)}")
+        if reveal_dealer:
+            desc_lines[-1] += f"  → **{d_val}{' (soft)' if d_soft else ''}**"
+        desc_lines.append(f"**You:**     {_hand_str(self.player)}  → **{p_val}{' (soft)' if p_soft else ''}**")
+
+        e = discord.Embed(
+            title=f"🎴 {headline}",
+            description="\n".join(desc_lines),
+            color=discord.Color.blurple()
+        )
+        e.set_footer(text=f"Bet: {self.bet} • Use the buttons below")
+        return e
+
+    async def _not_your_game(self, interaction):
+        await interaction.response.send_message("This isn’t your game. Start your own with `$blackjack <bet>` 🙂", ephemeral=True)
+
+    def _disable_all(self):
+        for child in self.children:
+            if isinstance(child, Button):
+                child.disabled = True
+
+    async def on_timeout(self):
+        if self.resolved or self.message is None:
+            return
+        # Auto-stand on timeout to settle the hand fairly
+        await self._do_stand(final_message="(Auto-stand on timeout)")
+
+    # ----- settlement logic -----
+    async def _finish(self, result: str, note: str = ""):
+        """result ∈ {'player_bj','player_win','dealer_win','push','player_bust','dealer_bust','surrender'}"""
+        if self.resolved:
+            return
+        self.resolved = True
+        uid = self.user_id
+        bal = get_balance(uid)
+        delta = 0
+
+        if result == 'player_bj':
+            # Natural blackjack pays 3:2
+            delta = int(self.bet * 1.5)
+        elif result == 'player_win' or result == 'dealer_bust':
+            delta = self.bet
+        elif result == 'push':
+            delta = 0
+        elif result == 'player_bust' or result == 'dealer_win':
+            delta = -self.bet
+        elif result == 'surrender':
+            delta = -(self.bet // 2)
+
+        new_bal = bal + delta
+        set_balance(uid, new_bal)
+
+        # Final board reveal
+        headline_map = {
+            'player_bj':    "Blackjack! 🔥 (3:2)",
+            'player_win':   "You win! 🎉",
+            'dealer_bust':  "Dealer busts — you win! 🎉",
+            'push':         "Push. 🤝",
+            'player_bust':  "Bust. 😬",
+            'dealer_win':   "Dealer wins. 😕",
+            'surrender':    "You surrendered. 🏳️"
+        }
+        headline = headline_map.get(result, "Result")
+
+        if note:
+            headline += f"  {note}"
+
+        emb = self._embed(reveal_dealer=True, headline=headline)
+        emb.add_field(name="Payout", value=f"{'+' if delta>=0 else ''}{delta}", inline=True)
+        emb.add_field(name="New Balance", value=f"{new_bal}", inline=True)
+        self._disable_all()
+        try:
+            await self.message.edit(embed=emb, view=self)
+        except Exception:
+            pass
+
+        # cleanup registry
+        active_blackjack.pop(uid, None)
+
+    def _dealer_play(self):
+        # Dealer draws according to rule
+        while True:
+            val, soft = _hand_value(self.dealer)
+            if val < 17 or (val == 17 and soft and DEALER_HITS_SOFT_17):
+                self.dealer.append(self.deck.pop())
+            else:
+                break
+
+    async def _do_stand(self, final_message: str = ""):
+        # If already settled due to blackjack etc., skip
+        if self.resolved:
+            return
+        self.first_action = False
+        self._dealer_play()
+        p_val, _ = _hand_value(self.player)
+        d_val, _ = _hand_value(self.dealer)
+
+        if p_val > 21:
+            await self._finish('player_bust', note=final_message)
+            return
+        if d_val > 21:
+            await self._finish('dealer_bust', note=final_message)
+            return
+        if p_val > d_val:
+            await self._finish('player_win', note=final_message)
+        elif p_val < d_val:
+            await self._finish('dealer_win', note=final_message)
+        else:
+            await self._finish('push', note=final_message)
+
+    async def _maybe_resolve_naturals(self):
+        p_val, _ = _hand_value(self.player)
+        d_val, _ = _hand_value(self.dealer)
+        if p_val == 21 and d_val == 21:
+            await self._finish('push', note="(Both have blackjack)")
+        elif p_val == 21:
+            await self._finish('player_bj')
+        # if dealer has blackjack and player doesn't, dealer wins immediately
+        elif d_val == 21:
+            await self._finish('dealer_win', note="(Dealer blackjack)")
+
+    # ----- Buttons -----
+    @discord.ui.button(label="Hit", style=discord.ButtonStyle.primary)
+    async def hit(self, interaction: discord.Interaction, button: Button):
+        if interaction.user.id != self.user_id:
+            return await self._not_your_game(interaction)
+        if self.resolved:
+            return
+        self.first_action = False
+        self.player.append(self.deck.pop())
+        p_val, _ = _hand_value(self.player)
+        if p_val > 21:
+            # Bust, reveal & settle
+            await self._finish('player_bust')
+            return
+        await interaction.response.edit_message(embed=self._embed(), view=self)
+
+    @discord.ui.button(label="Stand", style=discord.ButtonStyle.secondary)
+    async def stand(self, interaction: discord.Interaction, button: Button):
+        if interaction.user.id != self.user_id:
+            return await self._not_your_game(interaction)
+        if self.resolved:
+            return
+        await interaction.response.defer()
+        await self._do_stand()
+
+    @discord.ui.button(label="Double", style=discord.ButtonStyle.success)
+    async def double(self, interaction: discord.Interaction, button: Button):
+        if interaction.user.id != self.user_id:
+            return await self._not_your_game(interaction)
+        if self.resolved:
+            return
+        # Only allowed as the first action with exactly two cards
+        if not self.first_action or len(self.player) != 2:
+            return await interaction.response.send_message("You can only **double** as your first action (2-card hand).", ephemeral=True)
+
+        # Ensure they can cover the doubled stake
+        if get_balance(self.user_id) < self.bet * 2:
+            return await interaction.response.send_message("Not enough coins to double.", ephemeral=True)
+
+        self.doubled = True
+        self.bet *= 2
+        self.first_action = False
+
+        # Take exactly one card and then auto-stand
+        self.player.append(self.deck.pop())
+        await interaction.response.edit_message(embed=self._embed(), view=self)
+
+        # Resolve immediately
+        p_val, _ = _hand_value(self.player)
+        if p_val > 21:
+            await self._finish('player_bust', note="(after double)")
+        else:
+            await self._do_stand(final_message="(after double)")
+
+    @discord.ui.button(label="Surrender", style=discord.ButtonStyle.danger)
+    async def surrender(self, interaction: discord.Interaction, button: Button):
+        if interaction.user.id != self.user_id:
+            return await self._not_your_game(interaction)
+        if self.resolved:
+            return
+        if not self.first_action:
+            return await interaction.response.send_message("Surrender is only allowed as your first action.", ephemeral=True)
+        await interaction.response.defer()
+        await self._finish('surrender')
+
+@bot.command(aliases=["bj"])
+@commands.cooldown(1, 3, commands.BucketType.user)
+async def blackjack(ctx, bet: int):
+    """
+    Play Blackjack with your coin balance.
+    Usage: $blackjack 50
+    Rules:
+      • Blackjack pays 3:2
+      • Dealer hits soft 17 (configurable)
+      • Double only on first action
+      • Surrender only on first action (lose half bet)
+    """
+    if bet <= 0:
+        return await ctx.send("Bet must be a positive number.")
+    uid = ctx.author.id
+    if uid in active_blackjack:
+        return await ctx.send("You already have an active blackjack game. Finish it first.")
+
+    bal = get_balance(uid)
+    if bet > bal:
+        return await ctx.send(f"Not enough coins! Your balance is **{bal}**. Use `$daily` to top up.")
+
+    view = BlackjackView(ctx, bet)
+    active_blackjack[uid] = view
+    msg = await ctx.send(embed=view._embed(), view=view)
+    view.message = msg
+
+    # Check for naturals after the initial deal (may instantly end the game)
+    await view._maybe_resolve_naturals()
+
+
 # ----------------------------------------------------
 # RUN THE BOT
 # ----------------------------------------------------

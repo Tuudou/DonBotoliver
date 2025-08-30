@@ -1,0 +1,177 @@
+import discord
+from discord.ext import commands
+import os
+import random
+import aiohttp
+
+#Initialize the Bot object (now can handle both commands and events)
+TOKEN = os.getenv('token')
+intents = discord.Intents.all()
+
+bot = commands.Bot(command_prefix='$', intents=intents)
+
+# ----------------------------------------------------
+# EVENTS
+# ----------------------------------------------------
+
+@bot.event
+async def on_ready():
+    # Note: If the bot is already online, you must change the activity 
+    # using the bot object, not the non-existent client object.
+    await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.listening, name="Don Toliver 🤖"))
+    print(f'Link up with {bot.user}')
+
+@bot.event
+async def on_message(message):
+    if message.author.bot: # Simplified check for bot authors
+        return
+
+    # Check for simple text responses
+    message_content = message.content.lower()
+
+    if "hello" in message_content:
+        await message.channel.send('heyyyy!')
+
+    if "byc hydrate" in message_content:
+        await message.channel.send('CHEEERRSSS!!! 🥂')
+
+    # This is crucial: process commands *after* custom message handling
+    # so that commands like $test or $avatar still work.
+    await bot.process_commands(message) 
+
+# ----------------------------------------------------
+# COMMANDS
+# ----------------------------------------------------
+
+#pfp command
+@bot.command(aliases=['pfp', 'picture'])
+async def avatar(ctx, member: discord.Member = None):
+    """
+    displays pfp of user or user mentioned
+    """
+    #set target of pfp
+    target = member or ctx.author
+
+    #display the picture
+    embed = discord.Embed(
+        title=f"{target.display_name}'s Avatar",
+        color=discord.Color.blue()
+    )
+
+    # Use target.display_avatar.url
+    embed.set_image(url=target.display_avatar.url)
+
+    # Set requester
+    embed.set_footer(text=f"Requested by {ctx.author.display_name}", 
+                     icon_url=ctx.author.display_avatar.url)
+
+    await ctx.send(embed=embed)
+
+#roll command
+@bot.command(aliases=['dice'])
+async def roll(ctx, max_number: int = 100):
+  
+    # Generate a random integer between 1 and 100 (inclusive)
+    roll_result = random.randint(1, max_number)
+
+    # Send the result back to the channel, mentioning the user
+    await ctx.send(f"{ctx.author.mention} rolled a **{roll_result}**! 🎲")
+
+#rps command
+@bot.command(aliases=['rockpaperscissors'])
+async def rps(ctx, user_choice: str):
+  
+    user_choice = user_choice.lower()
+
+    # choices
+    valid_choices = ['rock', 'paper', 'scissors']
+    emojis = {
+        'rock': '🪨',
+        'paper': '📄',
+        'scissors': '✂️'
+    }
+
+    # validate input
+    if user_choice not in valid_choices:
+        await ctx.send("That's not a valid choice! Please use `rock`, `paper`, or `scissors`.")
+        return
+
+    # bot never loses
+    winning_moves = {
+        'rock': 'paper',      # Paper > rock
+        'paper': 'scissors',  # Scissors > paper
+        'scissors': 'rock'    # Rock > scissors
+    }
+    bot_choice = winning_moves[user_choice]
+
+    # send response
+    response = (
+        f"{ctx.author.mention}, you chose **{emojis[user_choice]} {user_choice}**.\n"
+        f"I choose **{emojis[bot_choice]} {bot_choice}**.\n\n"
+        "too ez 🫵😂"
+    )
+
+    await ctx.send(response)
+
+#cat command
+@bot.command(aliases=['kitty', 'meow'])
+async def cat(ctx):
+    """Posts a random picture or GIF of a cat."""
+    # Let the user know the bot is working on their request
+    async with ctx.typing():
+        try:
+            # We use an aiohttp.ClientSession for making web requests asynchronously
+            async with aiohttp.ClientSession() as session:
+                # Make a GET request to TheCatAPI
+                async with session.get('https://api.thecatapi.com/v1/images/search') as response:
+                    # Check if the request was successful (status code 200)
+                    if response.status == 200:
+                        # The response is in JSON format, so we parse it
+                        data = await response.json()
+                        cat_url = data[0]['url']
+
+                        # Create a nice, clean embed to display the image
+                        embed = discord.Embed(
+                            title="Here's a random cat! 🐱",
+                            color=discord.Color.purple() # You can change the color
+                        )
+                        embed.set_image(url=cat_url)
+                        embed.set_footer(text=f"Requested by {ctx.author.display_name}")
+
+                        await ctx.send(embed=embed)
+                    else:
+                        # If the API is down or there's an error
+                        await ctx.send("Sorry, I couldn't fetch a cat right now. Please try again later.")
+        except Exception as e:
+            # Handle any other errors that might occur
+            await ctx.send("An error occurred while trying to get a cat picture.")
+            print(f"Error in $cat command: {e}")
+
+#coinflip command
+@bot.command(aliases=['flip'])
+async def coinflip(ctx):
+    """Flips a coin and shows the result."""
+    # Send an initial message to the user
+    message = await ctx.send("Flipping the coin... 🤔")
+
+    # Define the two possible outcomes
+    choices = ['Heads', 'Tails']
+
+    # Use random.choice to pick one
+    result = random.choice(choices)
+
+    # Create a clean embed to show the result
+    embed = discord.Embed(
+        title="🪙 Coin Flip Result",
+        description=f"The coin landed on **{result}**!",
+        # Change the color based on the result for a little flair
+        color=discord.Color.gold() if result == 'Heads' else discord.Color.dark_grey()
+    )
+
+    # Edit the original message to show the final result
+    await message.edit(content=f"{ctx.author.mention}", embed=embed)
+# ----------------------------------------------------
+# RUN THE BOT
+# ----------------------------------------------------
+
+bot.run(TOKEN)

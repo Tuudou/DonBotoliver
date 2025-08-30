@@ -3,9 +3,14 @@ from discord.ext import commands
 import os
 import random
 import aiohttp
+from dotenv import load_dotenv
 
 #Initialize the Bot object (now can handle both commands and events)
-TOKEN = os.getenv('token')
+
+#get token
+load_dotenv()
+TOKEN = os.getenv('DISCORD_TOKEN')
+
 intents = discord.Intents.all()
 
 bot = commands.Bot(command_prefix='$', intents=intents)
